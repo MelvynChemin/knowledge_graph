@@ -1,0 +1,40 @@
+{
+  "triples": {
+    "entities": [
+      {
+        "name": "MIT",
+        "type": "Organization"
+      },
+      {
+        "name": "Cambridge, Massachusetts",
+        "type": "Location"
+      }
+    ],
+    "relationships": [
+      {
+        "source": "MIT",
+        "relation": "founded_in",
+        "target": "1861"
+      }
+    ]
+  },
+  "key_values": {
+    "entity_index": [
+      {
+        "key": "MIT",
+        "value": "A leading research university located in Cambridge, Massachusetts. Founded in 1861, MIT has been a significant force in scientific advancement, consistently pioneering breakthroughs across various fields. Its history includes significant contributions to the development of the field of electrical engineering and computer science."
+      },
+      {
+        "key": "Cambridge, Massachusetts",
+        "value": "A city in Massachusetts, known for its historical significance and a hub for innovation and education. MIT's location in Cambridge places it within a vibrant ecosystem of academic institutions and technological businesses."
+      }
+    ],
+    "relationships": [
+      {
+        "source": "MIT",
+        "relation": "founded_in",
+        "target": "1861"
+      }
+    ]
+  }
+}
