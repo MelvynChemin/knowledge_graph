@@ -17,7 +17,7 @@ from pyvis.network import Network
 class Neo4jLightRAG:
     """Class to handle Neo4j operations for LightRAG knowledge graphs"""
     
-    def __init__(self, uri="bolt://localhost:7687", user="neo4j", password="yourpassword"):
+    def __init__(self, uri="bolt://localhost:7687", user="neo4j", password="passtest"):
         """
         Initialize Neo4j connection
         
@@ -51,9 +51,12 @@ class Neo4jLightRAG:
             if properties is None:
                 properties = {}
             
+            # Sanitize entity_type to ensure valid Neo4j label
+            sanitized_type = sanitize_label(entity_type)
+            
             # Create node with dynamic label based on entity_type
             query = f"""
-            MERGE (e:{entity_type} {{name: $name}})
+            MERGE (e:{sanitized_type} {{name: $name}})
             SET e += $properties
             RETURN e
             """
@@ -305,7 +308,7 @@ if __name__ == "__main__":
     neo4j = Neo4jLightRAG(
         uri="bolt://localhost:7687",
         user="neo4j",
-        password="yourpassword"  # CHANGE THIS!
+        password="passtest"  # CHANGE THIS!
     )
     
     try:
@@ -371,5 +374,8 @@ Visualization:
    - Open http://localhost:7474 after starting Neo4j
    - Run Cypher queries to visualize
    - Example: MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 25
+    MATCH (n)
+    DETACH DELETE n
+
    - Interactive, beautiful, and built-in!
 """

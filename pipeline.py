@@ -1,27 +1,35 @@
-# pipeline.py - Refactored
+"""
+Knowledge Graph Builder
 
+A system for constructing knowledge graphs from text using LLM-based entity and relationship extraction.
+
+Architecture:
+1. Chunking: Split documents into manageable pieces
+2. Entity Extraction: Identify key entities (people, places, organizations, etc.)
+3. Relationship Extraction: Find connections between entities
+4. Graph Storage: Store in Neo4j graph database
+5. Indexing: Create searchable key-value index for entities
+"""
+
+import json
+from typing import Dict, List, Tuple, Any
 import ollama
 from chat import PromptTemplate, ChatOllamaMini
-import json
-from neo4j import GraphDatabase
 from neo4j_lightrag_storage import load_lightrag_data, Neo4jLightRAG
 
-# ============================================================================
-# TEXTUAL GRAPH BUILDER CLASS
-# ============================================================================
 
-class TextualGraphBuilder:
-    """Handles extraction and processing of text-based knowledge graphs"""
+class PromptTemplates:
+    """Storage for prompt templates used in knowledge graph extraction"""
     
-    def __init__(self, model="gemma3:1b", temperature=0.0):
-        self.llm = ChatOllamaMini(model=model, temperature=temperature)
-        self._setup_prompts()
-    
-    def _setup_prompts(self):
-        """Initialize the prompts for entity/relationship extraction"""
+    @staticmethod
+    def get_entity_extraction_prompt() -> PromptTemplate:
+        """
+        Prompt for extracting entities and relationships from text.
         
-        # Prompt for extracting entities and relationships
-        self.entity_prompt = PromptTemplate.from_messages([
+        Returns entities as concrete nouns and relationships as action verbs
+        connecting two entities.
+        """
+        return PromptTemplate.from_messages([
             ("system",
              """You are an expert knowledge graph builder. Extract entities and relationships from text.
 
@@ -63,9 +71,15 @@ class TextualGraphBuilder:
 Extract entities and relationships from the following text."""),
             ("user", "{text}"),          
         ])
+    
+    @staticmethod
+    def get_index_generation_prompt() -> PromptTemplate:
+        """
+        Prompt for generating searchable key-value index for entities.
         
-        # Prompt for generating searchable index
-        self.index_prompt = PromptTemplate.from_messages([
+        Creates summaries that include context and relationships for each entity.
+        """
+        return PromptTemplate.from_messages([
             ("system",
             """You are creating a searchable index for a knowledge graph database.
 
@@ -101,296 +115,349 @@ For each entity, generate key-value pairs:
 Generate the key-value index from the provided entities, relationships, and original text."""),
             ("user", "Entities and Relationships:{question} Original Text:{text}"), 
         ])
+
+
+class KnowledgeGraphExtractor:
+    """Handles LLM-based extraction of entities and relationships from text"""
     
-    def extract_entities_and_relations(self, text):
-        """Extract entities and relationships from text"""
+    def __init__(self, model: str = "gemma3:1b", temperature: float = 0.0, 
+                 base_url: str = "http://localhost:11434"):
+        """
+        Initialize the extractor with LLM configuration.
+        
+        Args:
+            model: Ollama model name to use
+            temperature: LLM temperature (0.0 for deterministic)
+            base_url: Ollama server URL
+        """
+        self.llm = ChatOllamaMini(model=model, temperature=temperature, base_url=base_url)
+        self.entity_prompt = PromptTemplates.get_entity_extraction_prompt()
+        self.index_prompt = PromptTemplates.get_index_generation_prompt()
+    
+    def extract_entities_and_relationships(self, text: str) -> str:
+        """
+        Extract entities and relationships from text using LLM.
+        
+        Args:
+            text: Input text to analyze
+            
+        Returns:
+            JSON string containing entities and relationships
+        """
         messages = self.entity_prompt.format(text=text)
-        response = self.llm.invoke(messages)
-        return response
+        return self.llm.invoke(messages)
     
-    def generate_index(self, entities_and_relations, original_text):
-        """Generate searchable index summaries"""
-        messages = self.index_prompt.format(
-            question=entities_and_relations, 
-            text=original_text
+    def generate_entity_index(self, triples: str, original_text: str) -> str:
+        """
+        Generate searchable key-value index for entities.
+        
+        Args:
+            triples: JSON string of extracted entities/relationships
+            original_text: Original source text for context
+            
+        Returns:
+            JSON string containing entity index
+        """
+        messages = self.index_prompt.format(question=triples, text=original_text)
+        return self.llm.invoke(messages)
+    
+    def extract_complete_knowledge_graph(self, text: str) -> Tuple[str, str]:
+        """
+        Complete pipeline: extract entities, relationships, and generate index.
+        
+        Args:
+            text: Input text to process
+            
+        Returns:
+            Tuple of (triples_json, key_values_json)
+        """
+        triples = self.extract_entities_and_relationships(text)
+        key_values = self.generate_entity_index(triples, text)
+        return triples, key_values
+
+
+class KnowledgeGraphBuilder:
+    """Main class for building and storing knowledge graphs"""
+    
+    def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str,
+                 model: str = "gemma3:1b"):
+        """
+        Initialize the knowledge graph builder.
+        
+        Args:
+            neo4j_uri: Neo4j database URI
+            neo4j_user: Neo4j username
+            neo4j_password: Neo4j password
+            model: Ollama model to use for extraction
+        """
+        self.extractor = KnowledgeGraphExtractor(model=model)
+        self.neo4j = Neo4jLightRAG(
+            uri=neo4j_uri,
+            user=neo4j_user,
+            password=neo4j_password
         )
-        response = self.llm.invoke(messages)
-        return response
     
-    def process_chunk(self, text, chunk_id):
-        """Full processing pipeline for a text chunk"""
-        # Step 1: Extract entities and relationships
-        triples = self.extract_entities_and_relations(text)
+    @staticmethod
+    def clean_code_fence(s: str) -> str:
+        """
+        Remove markdown code fences from LLM output.
         
-        # Step 2: Generate index
-        key_values = self.generate_index(triples, text)
+        Args:
+            s: String potentially containing ```json ... ```
+            
+        Returns:
+            Clean JSON string
+        """
+        s = s.strip()
+        if s.startswith("```"):
+            lines = s.splitlines()
+            lines = lines[1:]  # Drop first line (```json or ```)
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]  # Drop closing ```
+            s = "\n".join(lines).strip()
+        return s
+    
+    def save_extraction_results(self, triples: str, key_values: str, 
+                               name: str) -> Tuple[Dict, Dict]:
+        """
+        Clean, parse, and save extraction results to JSON file.
         
-        # Step 3: Clean and parse
-        triples_json = self._clean_code_fence(triples)
-        key_values_json = self._clean_code_fence(key_values)
+        Args:
+            triples: Raw triples JSON from LLM
+            key_values: Raw key-values JSON from LLM
+            name: Identifier for the output file
+            
+        Returns:
+            Tuple of (triples_dict, key_values_dict)
+        """
+        triples_json = self.clean_code_fence(triples)
+        key_values_json = self.clean_code_fence(key_values)
         
         triples_dict = json.loads(triples_json)
         key_values_dict = json.loads(key_values_json)
         
-        # Step 4: Save to file (optional)
-        self._save_to_file(triples_dict, key_values_dict, f"text_chunk_{chunk_id}")
+        # Save to file for debugging/archiving
+        output_data = {
+            "triples": triples_dict,
+            "key_values": key_values_dict
+        }
+        with open(f"knowledge_graph_data_{name}.json", "w") as f:
+            json.dump(output_data, f, indent=2)
         
         return triples_dict, key_values_dict
     
-    def _clean_code_fence(self, s):
-        """Remove markdown code fences from LLM output"""
-        s = s.strip()
-        if s.startswith("```"):
-            lines = s.splitlines()
-            lines = lines[1:]  # drop first line
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]  # drop last line
-            s = "\n".join(lines).strip()
-        return s
-    
-    def _save_to_file(self, triples, key_values, name):
-        """Save extracted data to JSON file"""
-        with open(f"knowledge_graph_data_{name}.json", "w") as f:
-            json.dump({
-                "triples": triples, 
-                "key_values": key_values
-            }, f, indent=2)
-
-
-# ============================================================================
-# MULTIMODAL GRAPH BUILDER CLASS
-# ============================================================================
-
-class MultimodalGraphBuilder:
-    """Handles extraction and processing of multimodal content (images, tables, etc)"""
-    
-    def __init__(self, vlm_model="llava:7b", temperature=0.0):
-        self.vlm_model = vlm_model
-        self.temperature = temperature
-    
-    def process_image(self, image_element, position, surrounding_context):
+    def process_chunk(self, text: str, chunk_id: int) -> bool:
         """
-        Process an image with its surrounding text context
+        Complete pipeline for processing a text chunk into knowledge graph.
+        
+        Steps:
+        1. Extract entities and relationships
+        2. Generate entity index
+        3. Save results to JSON
+        4. Load into Neo4j database
         
         Args:
-            image_element: Image data or path
-            position: Position in document
-            surrounding_context: Text from nearby chunks
+            text: Text chunk to process
+            chunk_id: Unique identifier for this chunk
+            
+        Returns:
+            True if successful
         """
-        # Generate detailed description
-        detailed_desc = self._generate_detailed_description(
-            image_element, 
-            surrounding_context
+        # Extract knowledge graph data
+        triples, key_values = self.extractor.extract_complete_knowledge_graph(text)
+        
+        # Save and parse results
+        saved_triples, saved_key_values = self.save_extraction_results(
+            triples, key_values, f"chunk_{chunk_id}"
         )
         
-        # Generate entity summary for graph
-        entity_summary = self._generate_entity_summary(
-            image_element,
-            surrounding_context
+        # Load into Neo4j
+        load_lightrag_data(
+            self.neo4j,
+            saved_triples['entities'],
+            saved_triples['relationships'],
+            saved_key_values['entity_index']
         )
         
-        return {
-            "detailed_description": detailed_desc,
-            "entity_summary": entity_summary,
-            "position": position,
-            "modality": "image"
-        }
+        return True
     
-    def process_table(self, table_data, position, surrounding_context):
-        """Process a table with its context"""
-        # TODO: implement table processing
-        pass
-    
-    def _generate_detailed_description(self, image_element, context):
-        """Generate comprehensive image description using VLM"""
-        prompt = f"""Analyze this image in the context of the surrounding document.
-
-**Surrounding text:**
-{context}
-
-**Task:** Provide a comprehensive description of the image that:
-1. Identifies all objects, people, text, and visual elements
-2. Explains relationships between elements  
-3. Notes colors, lighting, and visual style
-4. References connections to the surrounding text when relevant
-
-Respond in 2-3 paragraphs."""
+    def create_multimodal_graph(self, image_info: Dict[str, Any], 
+                               chunk_id: int) -> str:
+        """
+        Create multimodal knowledge graph with image anchor nodes.
         
-        # Call VLM (simplified - you'll need actual implementation)
-        # response = self._call_vlm(image_element, prompt)
-        # For now return placeholder
-        response = f"[VLM Description based on context: {context[:100]}...]"
-        return response
-    
-    def _generate_entity_summary(self, image_element, context):
-        """Extract entities from image for graph construction"""
-        prompt = f"""Based on this image and its document context, extract key entities for a knowledge graph.
-
-**Context:**
-{context}
-
-**Output JSON:**
-{{
-  "entity_name": "[descriptive name for this image]",
-  "entity_type": "image", 
-  "description": "concise summary",
-  "key_entities": ["entity1", "entity2", "entity3"]
-}}
-
-Extract entities that are visually present or strongly implied."""
+        Structure:
+        [Image_Anchor] <-belongs_to- [Entity1]
+        [Image_Anchor] <-belongs_to- [Entity2]
         
-        # Call VLM
-        # response = self._call_vlm(image_element, prompt)
-        # Placeholder
-        response = '{"entity_name": "Figure_1", "entity_type": "image", "key_entities": []}'
-        return response
-    
-    def _call_vlm(self, image_element, prompt):
-        """Call vision-language model (placeholder for now)"""
-        # TODO: Implement actual VLM call
-        # This would use ollama with llava or similar
-        return "[VLM response placeholder]"
-
-
-# ============================================================================
-# MAIN PROCESSING FUNCTIONS
-# ============================================================================
-
-def process_text_chunk(text, chunk_id, neo4j, text_builder):
-    """Process a single text chunk and load into Neo4j"""
-    triples_dict, key_values_dict = text_builder.process_chunk(text, chunk_id)
-    
-    # Load into Neo4j
-    load_lightrag_data(
-        neo4j, 
-        triples_dict['entities'], 
-        triples_dict['relationships'], 
-        key_values_dict['entity_index']
-    )
-    
-    return triples_dict, key_values_dict
-
-
-def process_multimodal_chunk(element, chunk_id, context, neo4j, mm_builder):
-    """Process a multimodal element (image/table) and create anchor node"""
-    
-    if element['type'] == 'image':
-        mm_info = mm_builder.process_image(
-            element['content'],
-            chunk_id,
-            context
+        Args:
+            image_info: Dictionary with 'image_path' and 'detailed_description'
+            chunk_id: Unique identifier for this image
+            
+        Returns:
+            Name of the created anchor node
+        """
+        # Create anchor node for the image
+        anchor_name = f"Image_{chunk_id}"
+        self.neo4j.create_entity(
+            entity_name=anchor_name,
+            entity_type="MultimodalAnchor",
+            properties={
+                "modality": "image",
+                "image_path": image_info['image_path'],
+                "detailed_description": image_info['detailed_description']
+            }
         )
-    elif element['type'] == 'table':
-        mm_info = mm_builder.process_table(
-            element['content'],
-            chunk_id, 
-            context
+        
+        # Extract entities from image description
+        triples, _ = self.extractor.extract_complete_knowledge_graph(
+            image_info['detailed_description']
         )
-    else:
-        return None
-    
-    # Create anchor node in Neo4j
-    anchor_name = f"MM_Anchor_{chunk_id}"
-    
-    neo4j.create_entity(
-        entity_name=anchor_name,
-        entity_type="MultimodalAnchor",
-        properties={
-            "modality": mm_info['modality'],
-            "position": mm_info['position'],
-            "detailed_description": mm_info['detailed_description']
-        }
-    )
-    
-    # Extract entities from description and link to anchor
-    # TODO: parse entity_summary and create belongs_to relationships
-    
-    return mm_info
+        triples_clean = self.clean_code_fence(triples)
+        entities_from_image = json.loads(triples_clean)
+        
+        # Create entity nodes and link to anchor
+        for entity in entities_from_image['entities']:
+            self.neo4j.create_entity(
+                entity_name=entity['name'],
+                entity_type=entity['type']
+            )
+            
+            # Create belongs_to relationship
+            self.neo4j.create_relationship(
+                source=entity['name'],
+                target=anchor_name,
+                relation_type="BELONGS_TO"
+            )
+        
+        return anchor_name
 
 
-def process_full_document(chunks, neo4j, delta=2):
+
+from parser import PDFParser
+from multimodal_processing import MultimodalProcessor
+
+def process_pdf_document(pdf_path: str, builder: KnowledgeGraphBuilder, multimodal: MultimodalProcessor):
     """
-    Process entire document with text and multimodal chunks
+    Process a PDF document, routing text to the graph builder and images to the multimodal processor.
     
     Args:
-        chunks: List of chunk dicts with 'type', 'content', 'position'
-        neo4j: Neo4j handler
-        delta: Context window size for multimodal elements
+        pdf_path: Path to the PDF file.
+        builder: KnowledgeGraphBuilder instance.
+        multimodal: MultimodalProcessor instance.
     """
-    text_builder = TextualGraphBuilder()
-    mm_builder = MultimodalGraphBuilder()
+    parser = PDFParser()
+    print(f"🚀 Starting PDF processing: {pdf_path}")
     
-    for i, chunk in enumerate(chunks):
+    chunk_counter = 0
+    
+    for chunk in parser.parse_pdf(pdf_path):
+        chunk_counter += 1
+        chunk_id = f"pdf_chunk_{chunk_counter}"
+        
         if chunk['type'] == 'text':
-            # Regular text processing
-            process_text_chunk(
-                chunk['content'], 
-                chunk['position'], 
-                neo4j,
-                text_builder
-            )
-            
-        elif chunk['type'] in ['image', 'table']:
-            # Get surrounding context
-            context = get_surrounding_context(chunks, i, delta)
-            
-            # Process multimodal element
-            process_multimodal_chunk(
-                chunk,
-                chunk['position'],
-                context,
-                neo4j,
-                mm_builder
-            )
+            print(f"  📄 Processing Text Chunk {chunk_counter} (Page {chunk['page']})...")
+            try:
+                builder.process_chunk(chunk['content'], chunk_id)
+            except Exception as e:
+                print(f"    ❌ Error processing text chunk: {e}")
+                
+        elif chunk['type'] == 'image':
+            print(f"  🖼️ Processing Image Chunk {chunk_counter} (Page {chunk['page']})...")
+            try:
+                image_info = multimodal.extract_image_info(chunk['content'], chunk['context'])
+                builder.create_multimodal_graph(image_info, chunk_counter)
+            except Exception as e:
+                print(f"    ❌ Error processing image chunk: {e}")
+
+    print("✅ PDF processing complete!")
 
 
-def get_surrounding_context(chunks, index, delta):
-    """Extract text context around a multimodal element"""
-    context_parts = []
+def process_image_document(image_path: str, builder: KnowledgeGraphBuilder, multimodal: MultimodalProcessor):
+    """
+    Process a single image document directly.
     
-    # Get chunks before
-    start_idx = max(0, index - delta)
-    for i in range(start_idx, index):
-        if chunks[i]['type'] == 'text':
-            context_parts.append(chunks[i]['content'])
+    Args:
+        image_path: Path to the image file.
+        builder: KnowledgeGraphBuilder instance.
+        multimodal: MultimodalProcessor instance.
+    """
+    print(f"🚀 Starting Image processing: {image_path}")
     
-    # Get chunks after
-    end_idx = min(len(chunks), index + delta + 1)
-    for i in range(index + 1, end_idx):
-        if chunks[i]['type'] == 'text':
-            context_parts.append(chunks[i]['content'])
-    
-    return "\n\n".join(context_parts)
+    try:
+        # For single image input, we pass empty context as there is no preceding text
+        image_info = multimodal.extract_image_info(image_path, surrounding_context="")
+        
+        # Use a generic ID or derive from filename
+        import os
+        image_name = os.path.basename(image_path)
+        chunk_id = f"image_{image_name}"
+        
+        builder.create_multimodal_graph(image_info, chunk_id)
+        print("✅ Image processing complete!")
+        
+    except Exception as e:
+        print(f"    ❌ Error processing image: {e}")
 
 
-# ============================================================================
-# MAIN EXECUTION (testing)
-# ============================================================================
-
-if __name__ == "__main__":
-    
-    neo4j = Neo4jLightRAG(
-        uri="bolt://localhost:7687",
-        user="neo4j",
-        password="yourpassword"
+def main():
+    """
+    Main execution function demonstrating knowledge graph construction.
+    """
+    # Initialize the knowledge graph builder
+    # Note: You might need to adjust credentials or make them configurable
+    builder = KnowledgeGraphBuilder(
+        neo4j_uri="bolt://localhost:7687",
+        neo4j_user="neo4j",
+        neo4j_password="yourpassword" 
     )
     
-    # Initialize builders
-    text_builder = TextualGraphBuilder()
+    # Initialize Multimodal Processor
+    multimodal = MultimodalProcessor()
     
-    # Test text chunks
-    Text1 = """Dr. Sarah Chen is a cardiologist at Stanford Medical Center who specializes in treating heart disease. In 2024, she published
+    # Example usage with a PDF or Image
+    # Check if a file path is provided via command line, otherwise use a default or prompt
+    import sys
+    import os
+    
+    file_path = "./images/sample.pdf" # Default
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+        
+    if os.path.exists(file_path):
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext == '.pdf':
+            process_pdf_document(file_path, builder, multimodal)
+        elif file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']:
+            process_image_document(file_path, builder, multimodal)
+        else:
+            print(f"⚠️ Unsupported file type: {file_ext}")
+            print("Supported types: .pdf, .jpg, .jpeg, .png")
+            
+    else:
+        print(f"⚠️ File not found: {file_path}")
+        print("Usage: python pipeline.py <path_to_file>")
+        
+        # Fallback to original text-only test if no file found
+        print("\nRunning fallback text-only test...")
+        text1 = """Dr. Sarah Chen is a cardiologist at Stanford Medical Center who specializes in treating heart disease. In 2024, she published
 groundbreaking research on using AI to diagnose arrhythmias early. Her work showed that machine learning models can detect
 irregular heartbeats with 95% accuracy. Dr. Chen collaborates with Dr. Michael Torres, a data scientist at MIT, to develop these AI
 diagnostic tools. The research was funded by the National Heart Institute and could revolutionize cardiac care."""
-    
-    Text2 = """MIT is a leading research university located in Cambridge, Massachusetts. Founded in 1861, MIT has been at the forefront of scientific research"""
-    
-    # Process text chunks
-    process_text_chunk(Text1, 1, neo4j, text_builder)
-    process_text_chunk(Text2, 2, neo4j, text_builder)
-    
-    print("✅ Processed text chunks and loaded into Neo4j")
-    
-    # For multimodal processing, you'd use:
-    # process_full_document(parsed_chunks, neo4j)
+        builder.process_chunk(text1, chunk_id=1)
+
+if __name__ == "__main__":
+    main()
+
+
+
+"""
+Visualization:
+**Neo4j Browser** (Built-in, Best Option)
+   - Open http://localhost:7474 after starting Neo4j
+   - Run Cypher queries to visualize
+   - Example: MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 25
+    MATCH (n)
+    DETACH DELETE n
+"""
